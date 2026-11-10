@@ -8,26 +8,30 @@
   <img src="https://img.shields.io/badge/author-Suprit%20Mangde-blueviolet?style=for-the-badge" />
 </p>
 
-> **RevalPack** is a standalone GUI-based security revalidation scanner built for offensive security professionals. It consolidates 43 vulnerability checks into a single desktop application — no browser, no server, no internet required.
+> **RevalPack** is a standalone GUI-based security revalidation scanner built for offensive security professionals. It consolidates **51 vulnerability checks** into a single desktop application — no browser, no server, no internet required.
 
 ---
 
 ## 📸 Screenshot
 
-> _Blue dark theme GUI with collapsible sidebar, real-time results table, and stop-scan capability._
+> _Blue dark theme GUI with collapsible sidebar, real-time results table, sortable columns, and stop-scan capability._
 
 ---
 
 ## 🔥 Features
 
-- **43 built-in scan modules** across 7 categories
-- **Collapsible sidebar** with mouse-wheel scrolling — no dropdown menus
+- **51 built-in scan modules** across 9 categories
+- **Multiport support** — scan multiple ports at once (e.g. `80,443,8080`)
+- **Collapsible sidebar** with live search and mouse-wheel scrolling
 - **Stop button** — cancel a running scan mid-way
+- **Sortable results** — click any column header (Status, Target, Port, Detail, Tool, Time)
+- **Tech Fingerprinting** — detect web server, framework, CMS, JS libs, CDN/WAF (Wappalyzer-style)
+- **Retire.js scanner** — detect outdated/vulnerable JavaScript libraries (jQuery, Bootstrap, Angular, etc.)
 - **Real-time results** with VULNERABLE / WARNING / SAFE / INFO / ERROR classification
 - **Export** results as TXT or CSV
 - **Auto-save** every scan to `revalpack_output/` folder
 - **Build to EXE** — single-file portable executable (no Python needed on target machine)
-- **Pure Python** — no external binary dependencies for most checks (nmap optional for some)
+- **Pure Python** — no external binary dependencies for most checks
 
 ---
 
@@ -77,7 +81,7 @@
 | HTTP Dangerous Methods | OPTIONS, PUT, DELETE exposure |
 | ASP.NET Debug Mode | X-AspNet-Version debug headers |
 
-### Web App (7 tools)
+### Web App (11 tools)
 | Tool | Description |
 |------|-------------|
 | crossdomain.xml Policy | Flash/Silverlight overly permissive policy |
@@ -87,13 +91,18 @@
 | jQuery (SSL bypass) | Same over HTTPS |
 | Server / X-Powered-By Header | Technology disclosure |
 | HTTP vs HTTPS (Unencrypted) | Plain HTTP exposure |
+| PHP Version Disclosure | PHP version in headers/body |
+| Apache Server Version Disclosure | Full Apache banner with OS/module info |
+| **Retire.js Vuln JS Libraries** 🆕 | Detects vulnerable jQuery, Bootstrap, Angular, React, Lodash, Moment, Vue |
+| **Tech Fingerprint (Wappalyzer)** 🆕 | Web server, framework, CMS, JS libs, CDN/WAF detection |
 
-### Network / Host (3 tools)
+### Network / Host (4 tools)
 | Tool | Description |
 |------|-------------|
 | SSH Weak Algorithms | Weak MACs, ciphers, KEX |
 | SMB Signing Check | Missing/not-required SMB signing |
 | Apache Tomcat Detection | Manager/status page exposure |
+| SMB Null Session Check | Anonymous SMB bind — CVE classic |
 
 ### Network Exploits (9 tools)
 | Tool | CVE |
@@ -107,6 +116,13 @@
 | Telnet Service Detection | — |
 | NTP monlist Amplification | CVE-2013-5211 |
 | DNS Recursive Query | — |
+
+### Recon (3 tools)
+| Tool | Description |
+|------|-------------|
+| Open Port Scanner + Versions | Fast threaded port scan with service/banner detection |
+| Database Ports Exposed | Checks MySQL, MSSQL, Oracle, Redis, MongoDB, etc. exposed to internet |
+| IIS Short Filename (Shortscan) | IIS 8.3 filename enumeration via tilde (~) wildcard — CVE-2010-2730 |
 
 ---
 
@@ -131,11 +147,6 @@ BUILD_EXE.bat
 
 The EXE will appear in `dist\RevalPack.exe` — copy it anywhere and run it.
 
-**Requirements for EXE build:**
-- Python 3.8+ installed
-- pip available
-- Windows 10/11
-
 ---
 
 ## 📋 Requirements
@@ -147,21 +158,18 @@ beautifulsoup4
 urllib3
 ```
 
-Optional (for nmap-based checks):
-```
-nmap  (for Heartbleed, EternalBlue, BlueKeep, SMBv1, RDP NLA, SSL Renegotiation)
-```
-
 ---
 
 ## 🎮 How to Use
 
 1. **Select a tool** from the left sidebar (click any group header to collapse/expand)
-2. **Enter targets** — one per line (IP, hostname, or URL)
-3. **Set port** — auto-filled from the tool default, change if needed
-4. Click **▶ RUN SCAN**
-5. Click **⏹ STOP** to cancel a running scan
-6. **Export** results as TXT or CSV
+2. **Search tools** using the search box at the top of the sidebar
+3. **Enter targets** — one per line (IP, hostname, or URL)
+4. **Set port** — auto-filled from tool default; supports **multiple ports** e.g. `80,443,8080`
+5. Click **▶ RUN SCAN**
+6. Click **⏹ STOP** to cancel mid-scan
+7. **Click any column header** to sort results (Status, Target, Port, Detail, Tool, Time)
+8. **Export** results as TXT or CSV
 
 **Target formats accepted:**
 ```
@@ -180,7 +188,7 @@ Results are auto-saved to `revalpack_output/` next to the executable:
 ```
 revalpack_output/
   tls_version_20241104_143022.txt
-  ssl_vuln_ciphers_20241104_143155.txt
+  tech_fingerprint_20241104_143155.txt
   ...
 ```
 
@@ -198,8 +206,7 @@ revalpack_output/
 ## 👤 Author
 
 **Suprit Mangde**  
-Senior Analyst – Offensive Security  
-[Shieldient Security](https://shieldient.com)
+Senior Analyst – Offensive Security
 
 ---
 
@@ -213,3 +220,5 @@ MIT License — see [LICENSE](LICENSE)
 
 - Inspired by [FastVulnVerify](https://github.com/0xhav0c/FastVulnVerify) by 0xhav0c
 - SSL checks modeled after [testssl.sh](https://github.com/drwetter/testssl.sh) methodology
+- JS vulnerability data based on [Retire.js](https://retirejs.github.io/retire.js/) project
+- Tech fingerprinting inspired by [Wappalyzer](https://www.wappalyzer.com/)
