@@ -1,7 +1,7 @@
 # RevalPack — Security Revalidation Scanner
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-4.0-blue?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/version-2.0-blue?style=for-the-badge" />
   <img src="https://img.shields.io/badge/python-3.8%2B-blue?style=for-the-badge&logo=python" />
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightblue?style=for-the-badge" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" />
