@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-RevalPack GUI — Shieldient Security Revalidation Scanner
+RevalPack GUI — Security Revalidation Scanner
 =========================================================
 Author : Suprit Mangde
-Company: Shieldient Security
+Author: Suprit Mangde | Offensive Security
 Version: 4.0 (FastVulnVerify Edition)
 
 Standalone GUI application. Runs scans directly inside the app.
@@ -701,6 +701,154 @@ class ScanEngine:
             except Exception as e:
                 self._e(f"{host}:{port}", str(e))
 
+    # ── 21a. PHP Version Disclosure ──────────────────────────────────────
+    def php_version(self, targets, port):
+        """Detect PHP version disclosed in HTTP response headers."""
+        import re as _re
+        PHP_HEADERS = ["X-Powered-By", "X-PHP-Version", "Server"]
+        PHP_RE = _re.compile(r'PHP[/ ]([\d.]+)', _re.IGNORECASE)
+        for raw in targets:
+            if self._stopped(): return
+            host = hostname_from(raw)
+            tgt = f"{host}:{port}"
+            found = False
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{host}:{port}/"
+                try:
+                    r = requests.get(url, timeout=8, verify=False, allow_redirects=True)
+                    all_headers = dict(r.headers)
+                    for hdr in PHP_HEADERS:
+                        val = all_headers.get(hdr, "") or all_headers.get(hdr.lower(), "")
+                        m = PHP_RE.search(val)
+                        if m:
+                            ver = m.group(1)
+                            self._v(tgt, f"PHP version disclosed in '{hdr}': PHP/{ver} — update and suppress version in php.ini")
+                            found = True
+                            break
+                    if not found:
+                        # Also scan body for common phpinfo() disclosure
+                        body = r.text[:4000]
+                        m2 = PHP_RE.search(body)
+                        if m2:
+                            self._w(tgt, f"PHP version found in page body: PHP/{m2.group(1)} — possible phpinfo() exposure")
+                            found = True
+                    break
+                except Exception:
+                    continue
+            if not found:
+                self._s(tgt, "No PHP version disclosed in headers or body")
+
+    # ── 21b. Apache Server Version Disclosure ────────────────────────────
+    def apache_version(self, targets, port):
+        """Detect Apache version and OS detail in Server header (ServerTokens Full/OS)."""
+        import re as _re
+        APACHE_RE = _re.compile(r'Apache(?:/(\S+))?', _re.IGNORECASE)
+        for raw in targets:
+            if self._stopped(): return
+            host = hostname_from(raw)
+            tgt = f"{host}:{port}"
+            found = False
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{host}:{port}/"
+                try:
+                    r = requests.get(url, timeout=8, verify=False, allow_redirects=True)
+                    server = r.headers.get("Server", "") or r.headers.get("server", "")
+                    m = APACHE_RE.search(server)
+                    if m:
+                        ver = m.group(1) or "(version hidden)"
+                        full_banner = server.strip()
+                        # Check for detailed disclosure (OS, modules)
+                        detail_level = "minimal"
+                        os_patterns = ["Ubuntu", "Debian", "CentOS", "Red Hat", "Win32", "Win64", "Fedora", "openSUSE"]
+                        if any(os in full_banner for os in os_patterns):
+                            detail_level = "FULL (OS + modules)"
+                        elif "(" in full_banner:
+                            detail_level = "detailed (modules listed)"
+                        if detail_level != "minimal":
+                            self._v(tgt, f"Apache version/OS disclosed: '{full_banner}' — set ServerTokens Prod in httpd.conf")
+                        else:
+                            self._w(tgt, f"Apache version disclosed: '{full_banner}' — set ServerTokens Prod to suppress version")
+                        found = True
+                    elif server:
+                        self._i(tgt, f"Non-Apache server: '{server}'")
+                        found = True
+                    break
+                except Exception:
+                    continue
+            if not found:
+                self._i(tgt, "Could not reach target or no Server header returned")
+
+    # ── 21c. SMB Null Session ─────────────────────────────────────────────
+    def smb_null_session(self, targets, port):
+        """Check if SMB null session (anonymous bind) is allowed — CVE classic / MS legacy."""
+        import struct as _struct, socket as _sock
+        def _smb_null_check(host, port):
+            # Build SMB negotiate + Session Setup Andx with null user/pass
+            # Netbios session request
+            nb_hdr = b'\x00\x00\x00\x2f'  # type 0, length 0x2f
+            nb_called = b'\x20' + b'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'[:30] + b'\x00'
+            nb_calling = b'\x20' + b'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'[:30] + b'\x00'
+            nb_msg = nb_hdr + nb_called[:32] + nb_calling[:32]
+
+            # Minimal SMBv1 Negotiate
+            smb_neg = (b'\xff\x53\x4d\x42' + b'\x72' + b'\x00\x00\x00\x00' +
+                       b'\x08' + b'\x01\xc8' + b'\x00' * 12 +
+                       b'\x00' + b'\x0c\x00' + b'\x02NTLM 0.12\x00')
+            netbios_len = len(smb_neg)
+            pkt = b'\x00' + netbios_len.to_bytes(3, 'big') + smb_neg
+
+            with _sock.create_connection((host, port), timeout=8) as s:
+                s.sendall(pkt)
+                data = s.recv(1024)
+                if len(data) < 8:
+                    return None, "Short response"
+                # SMBv1 response magic check
+                if data[4:8] != b'\xff\x53\x4d\x42':
+                    return None, "Not SMB response"
+
+                # Session Setup AnDX — null credentials
+                ss_null = (b'\xff\x53\x4d\x42' + b'\x73' + b'\x00\x00\x00\x00' +
+                           b'\x08\x01\xc8\x00' + b'\x00' * 12 + b'\x0d' +
+                           b'\xff\x00\x00\x00' + b'\xff\x03' + b'\x01\x00' +
+                           b'\x00\x00' + b'\x00\x00\x00\x00' + b'\x00\x00' +
+                           b'\x00\x00' + b'\x00\x00\x00\x00' + b'\x40\x00\x00\x00' +
+                           b'\x1a\x00' + b'\x00' + b'\x00' + b'\x00\x00' + b'\x00\x00' +
+                           b'W\x00i\x00n\x00d\x00o\x00w\x00s\x002\x000\x000\x000\x00\x00\x00' +
+                           b'\x00\x00')
+                sslen = len(ss_null)
+                ss_pkt = b'\x00' + sslen.to_bytes(3, 'big') + ss_null
+                s.sendall(ss_pkt)
+                resp = s.recv(1024)
+                if len(resp) < 9:
+                    return False, "No session setup response"
+                # NT_STATUS at offset 5-8 in SMB header (after 4-byte NetBIOS)
+                nt_status = int.from_bytes(resp[9:13], 'little')
+                if nt_status == 0x00000000:
+                    return True, "Null session accepted (NT_STATUS_SUCCESS)"
+                elif nt_status == 0xC000006D:
+                    return False, "Null session rejected (STATUS_LOGON_FAILURE)"
+                elif nt_status == 0xC0000022:
+                    return False, "Null session rejected (ACCESS_DENIED)"
+                else:
+                    return False, f"NT_STATUS: 0x{nt_status:08X}"
+
+        for raw in targets:
+            if self._stopped(): return
+            host = hostname_from(raw)
+            tgt = f"{host}:{port}"
+            try:
+                allowed, detail = _smb_null_check(host, port)
+                if allowed is True:
+                    self._v(tgt, f"SMB Null Session ALLOWED — {detail}. Restrict anonymous access in Local Security Policy")
+                elif allowed is False:
+                    self._s(tgt, f"SMB Null Session blocked — {detail}")
+                else:
+                    self._i(tgt, f"SMB Null Session check inconclusive — {detail}")
+            except ConnectionRefusedError:
+                self._i(tgt, "Port 445 closed or filtered")
+            except Exception as e:
+                self._e(tgt, f"SMB null session check failed: {e}")
+
     # ── 21. Tomcat ────────────────────────────────────────────────────────
     def tomcat(self, targets, port):
         def is_tomcat(text): return any(rx.search(text) for rx in TOMCAT_PATTERNS)
@@ -1314,6 +1462,361 @@ class ScanEngine:
             except Exception as e:
                 self._e(tgt, str(e))
 
+    # ════════════════════════════════════════════════════════════════════
+    #  NEW-01: Open Port Scanner with Service/Version Detection
+    # ════════════════════════════════════════════════════════════════════
+    def port_scan(self, targets, port):
+        """
+        Scan a wide range of common ports on each target.
+        Grab banners / TLS certs to identify service + version.
+        'port' param is ignored — we scan our own PORT_LIST.
+        """
+        # Common ports: web, DB, remote access, mail, infrastructure
+        PORT_LIST = [
+            21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143,
+            389, 443, 445, 465, 587, 631, 993, 995, 1433, 1521,
+            3306, 3389, 4444, 5432, 5900, 5985, 5986, 6379, 7001,
+            8080, 8443, 8888, 9200, 9300, 11211, 27017, 27018,
+        ]
+        SERVICE_MAP = {
+            21:"FTP", 22:"SSH", 23:"Telnet", 25:"SMTP", 53:"DNS",
+            80:"HTTP", 110:"POP3", 111:"RPC", 135:"MSRPC", 139:"NetBIOS",
+            143:"IMAP", 389:"LDAP", 443:"HTTPS", 445:"SMB", 465:"SMTPS",
+            587:"SMTP/TLS", 631:"IPP", 993:"IMAPS", 995:"POP3S",
+            1433:"MSSQL", 1521:"Oracle DB", 3306:"MySQL", 3389:"RDP",
+            4444:"Metasploit?", 5432:"PostgreSQL", 5900:"VNC",
+            5985:"WinRM-HTTP", 5986:"WinRM-HTTPS", 6379:"Redis",
+            7001:"WebLogic", 8080:"HTTP-Alt", 8443:"HTTPS-Alt",
+            8888:"HTTP-Alt", 9200:"Elasticsearch", 9300:"Elasticsearch",
+            11211:"Memcached", 27017:"MongoDB", 27018:"MongoDB",
+        }
+        RISKY_PORTS = {
+            23:"Telnet (unencrypted)", 135:"MSRPC (worm vector)",
+            139:"NetBIOS", 445:"SMB (EternalBlue/ransomware)",
+            4444:"Metasploit default listener", 5900:"VNC (often unauth)",
+            6379:"Redis (often unauthenticated)", 9200:"Elasticsearch (often unauth)",
+            11211:"Memcached (DDoS amplification)", 27017:"MongoDB (often unauth)",
+            1433:"MSSQL exposed", 1521:"Oracle DB exposed",
+            3306:"MySQL exposed", 5432:"PostgreSQL exposed",
+        }
+
+        def grab_banner(h, p, use_tls=False, timeout=4):
+            """Try to grab a service banner."""
+            try:
+                if use_tls:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    with socket.create_connection((h, p), timeout=timeout) as raw:
+                        with ctx.wrap_socket(raw, server_hostname=h) as s:
+                            # For HTTPS grab Server header
+                            try:
+                                s.sendall(f"HEAD / HTTP/1.0\r\nHost: {h}\r\n\r\n".encode())
+                                resp = s.recv(1024).decode(errors="replace")
+                                for line in resp.splitlines():
+                                    if line.lower().startswith("server:"):
+                                        return line.split(":",1)[1].strip()
+                            except: pass
+                            # Try cert CN
+                            cert = s.getpeercert()
+                            if cert:
+                                subj = dict(x[0] for x in cert.get("subject",()))
+                                return f"TLS CN={subj.get('commonName','?')}"
+                            return "TLS (no banner)"
+                else:
+                    with socket.create_connection((h, p), timeout=timeout) as s:
+                        s.settimeout(timeout)
+                        # Send HTTP probe for web ports
+                        if p in (80, 8080, 8888):
+                            s.sendall(f"HEAD / HTTP/1.0\r\nHost: {h}\r\n\r\n".encode())
+                        try:
+                            banner = s.recv(512).decode(errors="replace").strip()
+                            # Only first line of banner
+                            first = banner.splitlines()[0][:120] if banner else ""
+                            # For HTTP responses extract Server header
+                            if "HTTP/" in first:
+                                for line in banner.splitlines():
+                                    if line.lower().startswith("server:"):
+                                        return line.split(":",1)[1].strip()
+                                return first[:80]
+                            return first if first else "(connected, no banner)"
+                        except socket.timeout:
+                            return "(connected, no banner)"
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                return None
+            except Exception as e:
+                return None
+
+        for raw in targets:
+            host = hostname_from(raw)
+            self._i(host, f"Starting port scan on {host} — checking {len(PORT_LIST)} ports…")
+            open_ports = []
+
+            # Threaded connect scan
+            def check_port(p):
+                if self._stopped(): return None, None
+                # Try plain first
+                banner = grab_banner(host, p, use_tls=False)
+                if banner is None and p in (443, 8443, 5986, 993, 995, 465):
+                    banner = grab_banner(host, p, use_tls=True)
+                return p, banner
+
+            with ThreadPoolExecutor(max_workers=50) as ex:
+                futures = {ex.submit(check_port, p): p for p in PORT_LIST}
+                for fut in as_completed(futures):
+                    if self._stopped(): break
+                    p, banner = fut.result()
+                    if banner is not None:
+                        open_ports.append((p, banner))
+
+            if not open_ports:
+                self._s(host, "No common ports open (all filtered or closed)")
+                continue
+
+            open_ports.sort(key=lambda x: x[0])
+            for p, banner in open_ports:
+                svc  = SERVICE_MAP.get(p, "Unknown")
+                tgt  = f"{host}:{p}"
+                info = f"{svc} — {banner}" if banner and banner != "(connected, no banner)" else svc
+                if p in RISKY_PORTS:
+                    self._v(tgt, f"⚠ RISKY PORT OPEN: {RISKY_PORTS[p]} | Banner: {banner or 'n/a'}")
+                else:
+                    self._i(tgt, f"Open: {info}")
+
+            # Summary
+            risky = [p for p,_ in open_ports if p in RISKY_PORTS]
+            self._i(host,
+                f"Scan complete — {len(open_ports)} open port(s) found"
+                + (f" | {len(risky)} RISKY: {risky}" if risky else ""))
+
+    # ════════════════════════════════════════════════════════════════════
+    #  NEW-02: Database Ports Exposed to the Internet
+    # ════════════════════════════════════════════════════════════════════
+    def db_exposed(self, targets, port):
+        """
+        Check whether common database ports are reachable from the scanner
+        (i.e. exposed to the internet / network). Also attempts auth-less
+        banner grab to confirm the service and detect unauthenticated access.
+        """
+        DB_PORTS = {
+            1433:  ("MSSQL",       "Microsoft SQL Server"),
+            1521:  ("Oracle",      "Oracle Database"),
+            3306:  ("MySQL",       "MySQL / MariaDB"),
+            5432:  ("PostgreSQL",  "PostgreSQL"),
+            5984:  ("CouchDB",     "Apache CouchDB"),
+            6379:  ("Redis",       "Redis (often unauthenticated)"),
+            7474:  ("Neo4j",       "Neo4j Graph DB (HTTP API)"),
+            9042:  ("Cassandra",   "Apache Cassandra"),
+            9200:  ("Elastic",     "Elasticsearch (HTTP API)"),
+            9300:  ("Elastic",     "Elasticsearch (transport)"),
+            11211: ("Memcached",   "Memcached"),
+            27017: ("MongoDB",     "MongoDB"),
+            27018: ("MongoDB",     "MongoDB (shard)"),
+            28015: ("RethinkDB",   "RethinkDB"),
+            50000: ("DB2",         "IBM DB2"),
+            6432:  ("PgBouncer",   "PgBouncer (PostgreSQL proxy)"),
+        }
+
+        # Payloads that may elicit an identifying response without auth
+        AUTH_PROBES = {
+            6379:  b"PING\r\n",                              # Redis PING → +PONG
+            9200:  b"GET / HTTP/1.0\r\n\r\n",               # Elastic info
+            7474:  b"GET / HTTP/1.0\r\n\r\n",               # Neo4j HTTP
+            5984:  b"GET / HTTP/1.0\r\n\r\n",               # CouchDB
+            11211: b"stats\r\n",                             # Memcached
+            27017: (b"\x41\x00\x00\x00\x01\x00\x00\x00"    # MongoDB isMaster
+                    b"\x00\x00\x00\x00\xd4\x07\x00\x00"
+                    b"\x00\x00\x00\x00admin.$cmd\x00"
+                    b"\x00\x00\x00\x00\x01\x00\x00\x00"
+                    b"\x13\x00\x00\x00\x10isMaster\x00"
+                    b"\x01\x00\x00\x00\x00"),
+        }
+
+        # Indicators of unauthenticated access in response
+        UNAUTH_INDICATORS = {
+            6379:  ["+PONG", "+OK"],
+            9200:  ['"cluster_name"', '"version"', '"tagline"'],
+            7474:  ["neo4j", "Neo4j", "bolt"],
+            5984:  ['"couchdb"', '"version"'],
+            11211: ["STAT ", "VERSION "],
+            27017: [b"\x01\x00\x00\x00"],   # MongoDB OP_REPLY opcode
+        }
+
+        for raw in targets:
+            host = hostname_from(raw)
+            any_found = False
+
+            for db_port, (short, full_name) in DB_PORTS.items():
+                if self._stopped(): break
+                tgt = f"{host}:{db_port}"
+                try:
+                    with socket.create_connection((host, db_port), timeout=5) as s:
+                        s.settimeout(4)
+                        any_found = True
+                        # Send probe if we have one
+                        probe   = AUTH_PROBES.get(db_port)
+                        resp    = b""
+                        resp_s  = ""
+                        if probe:
+                            try:
+                                s.sendall(probe)
+                                resp   = s.recv(2048)
+                                resp_s = resp.decode(errors="replace")
+                            except: pass
+                        else:
+                            try: resp = s.recv(512); resp_s = resp.decode(errors="replace")
+                            except: pass
+
+                        # Check for unauthenticated access
+                        unauth = False
+                        indicators = UNAUTH_INDICATORS.get(db_port, [])
+                        for ind in indicators:
+                            if isinstance(ind, bytes):
+                                if ind in resp: unauth = True; break
+                            else:
+                                if ind in resp_s: unauth = True; break
+
+                        # Banner — first meaningful line
+                        banner = ""
+                        if resp_s:
+                            for line in resp_s.splitlines():
+                                line = line.strip()
+                                if line and len(line) > 2:
+                                    banner = line[:120]; break
+
+                        if unauth:
+                            self._v(tgt,
+                                f"🗄 {full_name} EXPOSED + UNAUTHENTICATED ACCESS — "
+                                f"no credentials required! Banner: {banner or 'n/a'}")
+                        else:
+                            self._v(tgt,
+                                f"🗄 {full_name} PORT EXPOSED to network"
+                                + (f" — Banner: {banner}" if banner else " (no banner / auth required)"))
+
+                except ConnectionRefusedError:
+                    self._s(tgt, f"{full_name}: Port closed")
+                except socket.timeout:
+                    self._s(tgt, f"{full_name}: Filtered / no response")
+                except Exception as e:
+                    self._i(tgt, f"{full_name}: {e}")
+
+            if not any_found:
+                self._s(host, "No database ports reachable from this scanner — good!")
+
+    # ════════════════════════════════════════════════════════════════════
+    #  SHORTSCAN — IIS Short Filename (8.3) Enumeration (CVE-2010-2730)
+    # ════════════════════════════════════════════════════════════════════
+    def shortscan(self, targets, port):
+        """
+        Pure-Python IIS tilde (~) short filename enumeration.
+        Replicates the core technique of Shortscan / IIS-ShortName-Scanner.
+
+        Method: Send HEAD requests with tilde wildcard paths.
+        IIS returns 404 (or 400) for valid short names vs 400 for invalid ones.
+        This reveals the first 6 chars of filenames and extensions.
+
+        CVE-2010-2730  /  OWASP: IIS Short Filename Disclosure
+        """
+        CHARSET   = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+        MAX_DEPTH = 6   # max filename chars to brute
+
+        def _probe(session, base_url, path_tilde):
+            """Return True if IIS indicates the short name exists."""
+            try:
+                r = session.head(base_url + path_tilde, timeout=6,
+                                 verify=False, allow_redirects=False)
+                # IIS leaks: 404 (exists), 400 (invalid), 200 (hit)
+                # Non-IIS returns consistent 400/404 for both → not vulnerable
+                return r.status_code in (200, 301, 302, 404)
+            except Exception:
+                return False
+
+        def _is_vulnerable(session, base_url):
+            """
+            Check if the server leaks short names by comparing responses:
+            valid tilde path vs definitely-invalid tilde path.
+            """
+            # Path that IIS WOULD respond to if vulnerable
+            test_valid   = "/*~1*/.aspx"
+            # Path that is always invalid
+            test_invalid = "/AAAAAAAAAAAAAAAAAAAA~1/.aspx"
+            try:
+                r1 = session.head(base_url + test_valid,   timeout=6, verify=False, allow_redirects=False)
+                r2 = session.head(base_url + test_invalid, timeout=6, verify=False, allow_redirects=False)
+                # Vulnerable: different status codes
+                return r1.status_code != r2.status_code
+            except Exception:
+                return False
+
+        def _enumerate(session, base_url, is_dir=False):
+            """Brute-force short file/dir names up to MAX_DEPTH chars."""
+            found = []
+            prefix_queue = [""]
+            while prefix_queue:
+                if self._stopped(): break
+                prefix = prefix_queue.pop(0)
+                if len(prefix) >= MAX_DEPTH:
+                    found.append(prefix + "~1" + ("/" if is_dir else ""))
+                    continue
+                any_child = False
+                for c in CHARSET:
+                    if self._stopped(): break
+                    candidate = prefix + c
+                    # Wildcard probe: candidate* exists?
+                    tilde_path = f"/{candidate}*~1{'/' if is_dir else '.*'}"
+                    if _probe(session, base_url, tilde_path):
+                        prefix_queue.append(candidate)
+                        any_child = True
+                if not any_child and prefix:
+                    found.append(prefix + "~1" + ("/" if is_dir else ""))
+            return found
+
+        for raw in targets:
+            scheme   = "https" if port in (443, 8443) else "http"
+            host     = hostname_from(raw)
+            base_url = f"{scheme}://{host}" + (f":{port}" if port not in (80,443) else "")
+            tgt      = f"{host}:{port}"
+
+            self._i(tgt, f"Shortscan: Testing IIS short filename disclosure on {base_url}…")
+
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept":     "*/*",
+            })
+
+            # 1. Vulnerability check
+            try:
+                vulnerable = _is_vulnerable(session, base_url)
+            except Exception as e:
+                self._e(tgt, f"Shortscan: Connection failed — {e}"); continue
+
+            if not vulnerable:
+                self._s(tgt, "Shortscan: Server does NOT appear vulnerable to IIS short filename disclosure")
+                continue
+
+            self._v(tgt, "Shortscan: SERVER IS VULNERABLE to IIS short filename (8.3) disclosure (CVE-2010-2730)!")
+
+            # 2. Enumerate files
+            self._i(tgt, "Shortscan: Enumerating short filenames (this may take a moment)…")
+            files = _enumerate(session, base_url, is_dir=False)
+            dirs  = _enumerate(session, base_url, is_dir=True)
+
+            if files:
+                for fn in files[:30]:   # cap output
+                    self._v(tgt, f"Shortscan FILE: {fn}* (short name disclosed — reconstruct full name manually)")
+            else:
+                self._i(tgt, "Shortscan: No files enumerated (server may rate-limit or require specific paths)")
+
+            if dirs:
+                for dn in dirs[:20]:
+                    self._w(tgt, f"Shortscan DIR:  {dn}* (directory short name disclosed)")
+
+            total = len(files) + len(dirs)
+            self._v(tgt,
+                f"Shortscan complete — {len(files)} file(s), {len(dirs)} dir(s) disclosed. "
+                f"Use shortscan CLI or IIS-ShortName-Scanner for full enumeration.")
+
     # ── dispatcher ────────────────────────────────────────────────────────
     DISPATCH = {
         "tls_version": tls_version, "ssl_complete": ssl_complete,
@@ -1337,6 +1840,13 @@ class ScanEngine:
         "proxylogon": proxylogon, "bigip_cookie": bigip_cookie,
         "dns_recursive": dns_recursive, "smbv1": smbv1,
         "ssl_renegotiation": ssl_renegotiation,
+        # New modules
+        "port_scan": port_scan,
+        "db_exposed": db_exposed,
+        "shortscan": shortscan,
+        "php_version": php_version,
+        "apache_version": apache_version,
+        "smb_null_session": smb_null_session,
     }
 
     def run(self, tool_key, targets, port):
@@ -1405,6 +1915,13 @@ TOOLS = [
     ("telnet_detect",       "Telnet Service Detection",         23,   "Network Exploits"),
     ("ntp_monlist",         "NTP monlist Amplification",        123,  "Network Exploits"),
     ("dns_recursive",       "DNS Recursive Query",              53,   "Network Exploits"),
+    # New tools
+    ("port_scan",           "Open Port Scanner + Versions",     0,    "Recon"),
+    ("db_exposed",          "Database Ports Exposed",           0,    "Recon"),
+    ("shortscan",           "IIS Short Filename (Shortscan)",   80,   "Recon"),
+    ("php_version",         "PHP Version Disclosure",           80,   "Web App"),
+    ("apache_version",      "Apache Server Version Disclosure", 80,   "Web App"),
+    ("smb_null_session",    "SMB Null Session Check",           445,  "Network/Host"),
 ]
 TOOL_BY_KEY = {t[0]: t for t in TOOLS}
 
@@ -1415,7 +1932,7 @@ TOOL_BY_KEY = {t[0]: t for t in TOOLS}
 class RevalPackApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("RevalPack v4.0 — Shieldient Security Scanner  |  Author: Suprit Mangde")
+        self.title("RevalPack v4.0 — Security Revalidation Scanner  |  Author: Suprit Mangde")
         self.geometry("1180x740")
         self.minsize(900, 600)
         self.configure(bg=DARK)
@@ -1441,13 +1958,56 @@ class RevalPackApp(tk.Tk):
         tk.Label(brand, text="RevalPack", bg=SIDEBAR, fg=WHITE,
                  font=("Segoe UI",13,"bold")).pack(side=tk.LEFT, anchor="w")
 
-        tk.Label(sb, text="Shieldient · Offensive Security", bg=SIDEBAR,
+        tk.Label(sb, text="Suprit Mangde · Offensive Security", bg=SIDEBAR,
                  fg=MUTED, font=("Segoe UI",9)).pack(padx=14, anchor="w", pady=(2,0))
         tk.Label(sb, text="Author: Suprit Mangde", bg=SIDEBAR,
                  fg=GREEN_L, font=("Segoe UI",8)).pack(padx=14, anchor="w", pady=(0,4))
 
+        # ── Search box ────────────────────────────────────────────────────
+        search_frame = tk.Frame(sb, bg=SIDEBAR)
+        search_frame.pack(fill=tk.X, padx=10, pady=(12,0))
+
+        # magnifier icon label
+        tk.Label(search_frame, text="🔍", bg=SIDEBAR, fg=MUTED,
+                 font=("Segoe UI",10)).pack(side=tk.LEFT, padx=(4,2))
+
+        self._search_var = tk.StringVar()
+        search_entry = tk.Entry(search_frame, textvariable=self._search_var,
+                                bg=CARD, fg=TEXT, insertbackground=GREEN_L,
+                                font=("Segoe UI",9), relief="flat",
+                                highlightthickness=1, highlightbackground=LINE,
+                                highlightcolor=GREEN)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0,4))
+        search_entry.insert(0, "Search tools…")
+        search_entry.configure(fg=MUTED)
+
+        def _search_focus_in(e):
+            if search_entry.get() == "Search tools…":
+                search_entry.delete(0, tk.END)
+                search_entry.configure(fg=TEXT)
+        def _search_focus_out(e):
+            if not search_entry.get().strip():
+                search_entry.insert(0, "Search tools…")
+                search_entry.configure(fg=MUTED)
+
+        search_entry.bind("<FocusIn>",  _search_focus_in)
+        search_entry.bind("<FocusOut>", _search_focus_out)
+
+        # Clear button
+        def _clear_search():
+            search_entry.delete(0, tk.END)
+            search_entry.insert(0, "Search tools…")
+            search_entry.configure(fg=MUTED)
+            self._search_var.set("")
+            self._filter_tools("")
+
+        clear_btn = tk.Label(search_frame, text="✕", bg=SIDEBAR, fg=MUTED,
+                             font=("Segoe UI",10), cursor="hand2", padx=4)
+        clear_btn.pack(side=tk.LEFT)
+        clear_btn.bind("<Button-1>", lambda e: _clear_search())
+
         tk.Label(sb, text="TOOLS", bg=SIDEBAR, fg=MUTED,
-                 font=("Segoe UI",8,"bold")).pack(padx=14, pady=(14,4), anchor="w")
+                 font=("Segoe UI",8,"bold")).pack(padx=14, pady=(10,2), anchor="w")
 
         # ── Scrollable sidebar canvas ──────────────────────────────────────
         sb_canvas = tk.Canvas(sb, bg=SIDEBAR, highlightthickness=0, bd=0)
@@ -1470,17 +2030,20 @@ class RevalPackApp(tk.Tk):
         sb_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # Build collapsible groups
-        self._tool_btns   = {}
-        self._group_frames = {}   # group -> (header_lbl, items_frame, collapsed_var)
+        self._tool_btns    = {}
+        self._group_frames = {}   # group -> (header_frame, items_frame, collapsed_var)
+        self._tool_names   = {}   # key -> display name (for search filtering)
+        self._sb_canvas    = sb_canvas
+        self._tool_frame   = tool_frame
 
-        from itertools import groupby as _grpby
         groups_ordered = []
-        seen_groups = {}
+        seen_groups    = {}
         for key, name, port, group in TOOLS:
             if group not in seen_groups:
                 seen_groups[group] = []
                 groups_ordered.append(group)
             seen_groups[group].append((key, name, port))
+            self._tool_names[key] = name.lower()
 
         for group in groups_ordered:
             # Group header — click to collapse/expand
@@ -1665,12 +2228,16 @@ class RevalPackApp(tk.Tk):
         cols = ("status","target","port","detail","tool","time")
         self._tree = ttk.Treeview(tbl_frame, columns=cols, show="headings",
                                    style="Dark.Treeview")
-        for col, hdr, w in [
-            ("status","Status",90), ("target","Target",200),
-            ("port","Port",55), ("detail","Detail",480),
-            ("tool","Tool",140), ("time","Time",90),
-        ]:
-            self._tree.heading(col, text=hdr)
+        self._sort_state = {}   # col -> ascending bool
+
+        col_defs = [
+            ("status","Status ▲▼",90), ("target","Target ▲▼",200),
+            ("port","Port ▲▼",55), ("detail","Detail ▲▼",480),
+            ("tool","Tool ▲▼",140), ("time","Time ▲▼",90),
+        ]
+        for col, hdr, w in col_defs:
+            self._tree.heading(col, text=hdr,
+                               command=lambda c=col: self._sort_column(c))
             self._tree.column(col, width=w, minwidth=40)
 
         self._tree.tag_configure("VULNERABLE", foreground=RED)
@@ -1689,6 +2256,79 @@ class RevalPackApp(tk.Tk):
         tbl_frame.columnconfigure(0, weight=1)
 
         self._current_tool = None
+
+        # Wire search box live filtering
+        def _on_search(*_):
+            val = self._search_var.get()
+            if val == "Search tools…": val = ""
+            self._filter_tools(val)
+        self._search_var.trace_add("write", _on_search)
+
+    # ── SEARCH FILTER ─────────────────────────────────────────────────────
+    def _filter_tools(self, query):
+        q = query.strip().lower()
+        is_searching = bool(q) and q != "search tools…"
+
+        for group, (grp_hdr, items_frame, collapsed) in self._group_frames.items():
+            group_has_match = False
+            for key, btn in self._tool_btns.items():
+                # Only check buttons in this group's items_frame
+                if str(btn.master) != str(items_frame):
+                    continue
+                name = self._tool_names.get(key, "")
+                match = (not is_searching) or (q in name) or (q in group.lower())
+                if match:
+                    btn.pack(fill=tk.X, padx=2, pady=1)
+                    group_has_match = True
+                else:
+                    btn.pack_forget()
+
+            if is_searching:
+                if group_has_match:
+                    grp_hdr.pack(fill=tk.X, padx=4, pady=(10,0))
+                    items_frame.pack(fill=tk.X, padx=2)
+                    collapsed.set(False)
+                else:
+                    grp_hdr.pack_forget()
+                    items_frame.pack_forget()
+            else:
+                # Restore normal layout — show all groups, respect collapsed state
+                grp_hdr.pack(fill=tk.X, padx=4, pady=(10,0))
+                if not collapsed.get():
+                    items_frame.pack(fill=tk.X, padx=2)
+
+        self._tool_frame.update_idletasks()
+        self._sb_canvas.configure(scrollregion=self._sb_canvas.bbox("all"))
+        self._sb_canvas.yview_moveto(0)
+
+    # ── SORT COLUMN ───────────────────────────────────────────────────────
+    def _sort_column(self, col):
+        asc = not self._sort_state.get(col, False)
+        self._sort_state[col] = asc
+
+        # Pull all rows out
+        rows = [(self._tree.set(iid, col), iid) for iid in self._tree.get_children("")]
+
+        # Sort — port column numeric, others string
+        STATUS_ORDER = {"VULNERABLE":0,"WARNING":1,"INFO":2,"SAFE":3,"ERROR":4}
+        if col == "port":
+            rows.sort(key=lambda x: int(x[0]) if x[0].isdigit() else 0, reverse=not asc)
+        elif col == "status":
+            rows.sort(key=lambda x: STATUS_ORDER.get(x[0], 9), reverse=not asc)
+        else:
+            rows.sort(key=lambda x: x[0].lower(), reverse=not asc)
+
+        for idx, (_, iid) in enumerate(rows):
+            self._tree.move(iid, "", idx)
+
+        # Update heading arrows
+        col_labels = {
+            "status":"Status","target":"Target","port":"Port",
+            "detail":"Detail","tool":"Tool","time":"Time"
+        }
+        for c in ("status","target","port","detail","tool","time"):
+            arrow = (" ↑" if asc else " ↓") if c == col else " ▲▼"
+            self._tree.heading(c, text=col_labels[c]+arrow)
 
     # ── TOOL SELECTION ────────────────────────────────────────────────────
     def _select_tool(self, key):
@@ -1823,7 +2463,7 @@ class RevalPackApp(tk.Tk):
         if not path: return
         with open(path,"w",encoding="utf-8") as f:
             f.write("RevalPack — Security Scan Report\n")
-            f.write(f"Shieldient · Offensive Security\n")
+            f.write(f"Suprit Mangde · Offensive Security\n")
             f.write(f"Generated: {datetime.datetime.now()}\n{'='*60}\n\n")
             counts = {s:sum(1 for r in self._results if r['status']==s) for s in ["VULNERABLE","WARNING","SAFE","INFO"]}
             f.write(f"Total: {len(self._results)}  Vulnerable: {counts['VULNERABLE']}  Warning: {counts['WARNING']}  Safe: {counts['SAFE']}\n\n")
