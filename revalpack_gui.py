@@ -1818,6 +1818,195 @@ class ScanEngine:
                 f"Use shortscan CLI or IIS-ShortName-Scanner for full enumeration.")
 
     # ── dispatcher ────────────────────────────────────────────────────────
+    # ── Retire.js — Vulnerable JavaScript Library Detection ──────────────
+    def retirejs(self, targets, port):
+        """Detect outdated/vulnerable JS libraries (jQuery, Bootstrap, Angular, etc.)
+        by fetching page HTML and checking script src versions against known CVEs."""
+        import re as _re
+        # Known vulnerable version ranges: {lib: [(max_safe_ver, cve, severity), ...]}
+        VULN_DB = {
+            "jquery": [
+                ("1.12.4", "CVE-2019-11358 (prototype pollution)", "HIGH"),
+                ("3.4.0",  "CVE-2019-11358 (prototype pollution)", "HIGH"),
+                ("3.5.0",  "CVE-2020-11022/11023 (XSS via HTML)", "HIGH"),
+            ],
+            "bootstrap": [
+                ("3.4.0",  "CVE-2018-14041/14042 (XSS)", "MEDIUM"),
+                ("4.3.0",  "CVE-2019-8331 (XSS tooltip)", "MEDIUM"),
+            ],
+            "angular": [
+                ("1.6.0",  "CVE-2019-14863 (XSS)", "HIGH"),
+                ("1.7.9",  "CVE-2020-7676 (XSS)", "HIGH"),
+            ],
+            "angularjs": [
+                ("1.6.0",  "CVE-2019-14863 (XSS)", "HIGH"),
+                ("1.7.9",  "CVE-2020-7676 (XSS)", "HIGH"),
+            ],
+            "react": [
+                ("16.0.0", "CVE-2018-6341 (XSS dangerouslySetInnerHTML)", "MEDIUM"),
+            ],
+            "lodash": [
+                ("4.17.11","CVE-2019-10744 (prototype pollution)", "HIGH"),
+                ("4.17.20","CVE-2020-28500 (ReDoS)", "MEDIUM"),
+            ],
+            "moment": [
+                ("2.29.1", "CVE-2022-24785 (path traversal)", "HIGH"),
+            ],
+            "vue": [
+                ("2.6.10", "CVE-2021-22931 (XSS)", "MEDIUM"),
+            ],
+        }
+        # Regex to find <script src="...lib-version...">
+        SCRIPT_RE = _re.compile(
+            r'<script[^>]+src=["\']([^"\']*?'
+            r'(jquery|bootstrap|angular(?:js)?|react|lodash|moment|vue)'
+            r'[^"\']*?)["\']',
+            _re.IGNORECASE)
+        VER_RE = _re.compile(r'[-./](\d+\.\d+\.?\d*)', _re.IGNORECASE)
+
+        def _parse_ver(v):
+            try:
+                parts = [int(x) for x in v.split(".")[:3]]
+                while len(parts) < 3: parts.append(0)
+                return tuple(parts)
+            except: return (0, 0, 0)
+
+        def _is_vulnerable(lib, ver_str):
+            issues = []
+            vt = _parse_ver(ver_str)
+            for max_safe, cve, sev in VULN_DB.get(lib.lower(), []):
+                if vt <= _parse_ver(max_safe):
+                    issues.append(f"{cve} [{sev}]")
+            return issues
+
+        for raw in targets:
+            if self._stopped(): return
+            host = hostname_from(raw)
+            tgt = f"{host}:{port}"
+            found_any = False
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{host}:{port}/"
+                try:
+                    r = requests.get(url, timeout=10, verify=False, allow_redirects=True)
+                    scripts = SCRIPT_RE.findall(r.text)
+                    if not scripts:
+                        self._i(tgt, "No known JS libraries found in page source")
+                        found_any = True
+                        break
+                    seen = set()
+                    for src_full, lib in scripts:
+                        if lib.lower() in seen: continue
+                        seen.add(lib.lower())
+                        # Extract version from filename
+                        m = VER_RE.search(src_full)
+                        ver = m.group(1) if m else None
+                        if not ver:
+                            self._i(tgt, f"{lib}: found (version undetectable) — {src_full[:80]}")
+                            continue
+                        issues = _is_vulnerable(lib, ver)
+                        if issues:
+                            self._v(tgt, f"{lib} v{ver} VULNERABLE — " + ", ".join(issues) + f" | src: {src_full[:80]}")
+                        else:
+                            self._s(tgt, f"{lib} v{ver} — no known CVEs in Retire.js DB")
+                    found_any = True
+                    break
+                except Exception:
+                    continue
+            if not found_any:
+                self._e(tgt, "Could not reach target for Retire.js scan")
+
+    # ── Tech Fingerprint (Wappalyzer-style) ───────────────────────────────
+    def tech_fingerprint(self, targets, port):
+        """Detect tech stack from HTTP headers + HTML patterns:
+        web server, framework, CMS, JS libraries, OS."""
+        import re as _re
+        SIGNATURES = {
+            # (category, name, [header_patterns], [body_patterns])
+            "Web Server": [
+                ("Apache",       [("Server", r"Apache(?:/[\d.]+)?")],  []),
+                ("Nginx",        [("Server", r"nginx(?:/[\d.]+)?")],   []),
+                ("IIS",          [("Server", r"Microsoft-IIS(?:/[\d.]+)?")], []),
+                ("LiteSpeed",    [("Server", r"LiteSpeed")],           []),
+                ("Cloudflare",   [("Server", r"cloudflare"), ("CF-RAY", r".")], []),
+                ("Caddy",        [("Server", r"Caddy")],               []),
+            ],
+            "Framework": [
+                ("ASP.NET",      [("X-Powered-By", r"ASP\.NET"), ("X-AspNet-Version", r".")], [r'__VIEWSTATE', r'asp\.net']),
+                ("PHP",          [("X-Powered-By", r"PHP/[\d.]+")],   [r'\.php']),
+                ("Django",       [("X-Frame-Options", r"SAMEORIGIN")], [r'csrfmiddlewaretoken', r'django']),
+                ("Laravel",      [("Set-Cookie", r"laravel_session")], [r'laravel']),
+                ("Ruby on Rails",[("X-Powered-By", r"Phusion Passenger")], [r'csrf-token.*rails']),
+                ("Express/Node", [("X-Powered-By", r"Express")],      []),
+                ("Spring",       [("X-Application-Context", r".")],   [r'spring', r'Whitelabel Error']),
+            ],
+            "CMS": [
+                ("WordPress",    [],  [r'/wp-content/', r'/wp-includes/', r'wp-json']),
+                ("Joomla",       [],  [r'/components/com_', r'Joomla!']),
+                ("Drupal",       [("X-Generator", r"Drupal")], [r'Drupal\.settings', r'/sites/default/']),
+                ("Magento",      [],  [r'Mage\.Cookies', r'/skin/frontend/']),
+                ("Shopify",      [],  [r'cdn\.shopify\.com', r'Shopify\.theme']),
+                ("Squarespace",  [],  [r'squarespace\.com', r'static\.squarespace']),
+            ],
+            "JS Library": [
+                ("jQuery",       [],  [r'jquery(?:\.min)?\.js', r"jQuery v?([\d.]+)"]),
+                ("React",        [],  [r'react(?:\.min)?\.js', r'react-dom', r'__reactFiber']),
+                ("Angular",      [],  [r'angular(?:\.min)?\.js', r'ng-version=']),
+                ("Vue.js",       [],  [r'vue(?:\.min)?\.js', r'__vue__']),
+                ("Bootstrap",    [],  [r'bootstrap(?:\.min)?\.(?:js|css)']),
+            ],
+            "CDN / WAF": [
+                ("Cloudflare WAF",[("CF-RAY", r".")], []),
+                ("Akamai",       [("X-Check-Cacheable", r".")], []),
+                ("Imperva",      [("X-Iinfo", r".")], []),
+                ("AWS CloudFront",[("X-Cache", r"CloudFront"), ("Via", r"CloudFront")], []),
+                ("Fastly",       [("X-Served-By", r"cache-")], []),
+            ],
+            "Operating System": [
+                ("Windows Server",[("Server", r"Win(?:32|64|dows)")], []),
+                ("Ubuntu",       [("Server", r"Ubuntu")],  []),
+                ("Debian",       [("Server", r"Debian")],  []),
+                ("CentOS",       [("Server", r"CentOS")],  []),
+            ],
+        }
+
+        for raw in targets:
+            if self._stopped(): return
+            host = hostname_from(raw)
+            tgt = f"{host}:{port}"
+            detected = []
+            for scheme in ("https", "http"):
+                url = f"{scheme}://{host}:{port}/"
+                try:
+                    r = requests.get(url, timeout=10, verify=False, allow_redirects=True)
+                    hdrs = {k.lower(): v for k, v in r.headers.items()}
+                    body = r.text[:8000]
+                    for category, sigs in SIGNATURES.items():
+                        for name, hdr_pats, body_pats in sigs:
+                            matched = False
+                            for hdr, pat in hdr_pats:
+                                val = hdrs.get(hdr.lower(), "")
+                                if val and _re.search(pat, val, _re.IGNORECASE):
+                                    matched = True; break
+                            if not matched:
+                                for pat in body_pats:
+                                    if _re.search(pat, body, _re.IGNORECASE):
+                                        matched = True; break
+                            if matched:
+                                detected.append(f"[{category}] {name}")
+                    break
+                except Exception:
+                    continue
+            if detected:
+                summary = " | ".join(detected)
+                self._i(tgt, f"Tech Stack: {summary}")
+                # Flag outdated/risky items
+                risky = [d for d in detected if any(x in d for x in
+                    ["IIS", "ASP.NET", "WordPress", "Joomla", "Magento", "jQuery"])]
+                if risky:
+                    self._w(tgt, f"Review these for known CVEs: {', '.join(risky)}")
+            else:
+                self._i(tgt, "No technology signatures detected")
+
     DISPATCH = {
         "tls_version": tls_version, "ssl_complete": ssl_complete,
         "ssl_vuln_ciphers": ssl_vuln_ciphers, "sweet32": sweet32,
@@ -1847,6 +2036,8 @@ class ScanEngine:
         "php_version": php_version,
         "apache_version": apache_version,
         "smb_null_session": smb_null_session,
+        "retirejs": retirejs,
+        "tech_fingerprint": tech_fingerprint,
     }
 
     def run(self, tool_key, targets, port):
@@ -1922,6 +2113,8 @@ TOOLS = [
     ("php_version",         "PHP Version Disclosure",           80,   "Web App"),
     ("apache_version",      "Apache Server Version Disclosure", 80,   "Web App"),
     ("smb_null_session",    "SMB Null Session Check",           445,  "Network/Host"),
+    ("retirejs",            "Retire.js Vuln JS Libraries",      80,   "Web App"),
+    ("tech_fingerprint",    "Tech Fingerprint (Wappalyzer)",    80,   "Recon"),
 ]
 TOOL_BY_KEY = {t[0]: t for t in TOOLS}
 
@@ -2355,10 +2548,19 @@ class RevalPackApp(tk.Tk):
         if not targets:
             messagebox.showwarning("No targets", "Enter at least one IP/hostname/URL.")
             return
-        try:
-            port = int(self._port_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid port", "Port must be a number.")
+        # Parse multiport: "80,443,8080" or single "443"
+        raw_port = self._port_var.get().strip()
+        ports = []
+        for p in raw_port.split(","):
+            p = p.strip()
+            if p:
+                try:
+                    ports.append(int(p))
+                except ValueError:
+                    messagebox.showerror("Invalid port", f"'{p}' is not a valid port number.")
+                    return
+        if not ports:
+            messagebox.showerror("Invalid port", "Enter at least one port number.")
             return
 
         self._running = True
@@ -2367,22 +2569,33 @@ class RevalPackApp(tk.Tk):
         self._stop_btn.configure(state=tk.NORMAL)
         self._progress.pack(side=tk.LEFT, pady=4)
         self._progress.start(12)
-        self._status_lbl.configure(text=f"Scanning {len(targets)} target(s)…")
+        multi = f"{len(ports)} ports" if len(ports) > 1 else f"port {ports[0]}"
+        self._status_lbl.configure(text=f"Scanning {len(targets)} target(s) on {multi}…")
 
         tool_key = self._current_tool
 
         def worker():
-            def emit(status, target, detail):
+            def emit(status, target, detail, port_used=ports[0]):
                 if self._stop_flag:
                     return
                 ts = datetime.datetime.now().strftime("%H:%M:%S")
-                self._q.put(("row", status, target, str(self._port_var.get()), detail, tool_key, ts))
+                self._q.put(("row", status, target, str(port_used), detail, tool_key, ts))
             try:
                 engine = ScanEngine(emit)
                 engine.stop_flag = lambda: self._stop_flag
-                engine.run(tool_key, targets, port)
+                for port in ports:
+                    if self._stop_flag: break
+                    # Patch emit to carry correct port for each run
+                    def make_emit(p):
+                        def _emit(status, target, detail):
+                            if self._stop_flag: return
+                            ts = datetime.datetime.now().strftime("%H:%M:%S")
+                            self._q.put(("row", status, target, str(p), detail, tool_key, ts))
+                        return _emit
+                    engine.emit = make_emit(port)
+                    engine.run(tool_key, targets, port)
             except Exception as e:
-                self._q.put(("row","ERROR","engine",str(port),str(e),tool_key,
+                self._q.put(("row","ERROR","engine",raw_port,str(e),tool_key,
                               datetime.datetime.now().strftime("%H:%M:%S")))
             finally:
                 self._q.put(("done",))
