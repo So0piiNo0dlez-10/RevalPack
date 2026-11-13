@@ -14,7 +14,11 @@
 
 ## 📸 Screenshot
 
-> _Blue dark theme GUI with collapsible sidebar, real-time results table, sortable columns, and stop-scan capability._
+### Main Interface
+![RevalPack Main](screenshots/main.png)
+
+### Scan Results
+![Scan Results](screenshots/scan_results.png)
 
 ---
 
